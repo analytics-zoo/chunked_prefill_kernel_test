@@ -102,6 +102,7 @@ class TestChunkedPrefill(TestCase):
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
         causal: bool = True,
+        use_v2: bool = False,
     ) -> None:
         query = query.to("xpu")
         key_cache = key_cache.to("xpu")
@@ -111,17 +112,29 @@ class TestChunkedPrefill(TestCase):
         cu_seqlen_q = cu_seqlen_q.to("xpu")
         num_query_heads = query.shape[1] 
         # (num_blocks, num_kv_heads, block_size, head_size) 
-        head_dim = value_cache.shape[3]
-        num_kv_heads = value_cache.shape[1]
-        block_size = value_cache.shape[2]
         num_batch = cu_seqlen_q.shape[0] - 1
         num_tokens = query.shape[0]
         max_num_blocks_per_seq = block_tables.shape[1]
+        if not use_v2:
+            head_dim = value_cache.shape[3]
+            num_kv_heads = value_cache.shape[1]
+            block_size = value_cache.shape[2]
+        else:
+            head_dim = value_cache.shape[2]
+            block_size = value_cache.shape[3]
+            num_kv_heads = value_cache.shape[1]
 
         # (num_blocks, num_kv_heads, block_size, head_size) 
         # -> (num_blocks, block_size, num_kv_heads, head_size)  
-        key_cache = key_cache.transpose(1, 2).contiguous()
-        value_cache = value_cache.transpose(1, 2).contiguous()
+        if use_v2:
+            # Use permute to change to (num_blocks, block_size, num_heads, head_size // 8, 8)
+            # Then merge the last two dimension
+            key_cache = key_cache.permute(0, 3, 1, 2, 4).contiguous()
+            key_cache = key_cache.view(key_cache.size(0), key_cache.size(1), key_cache.size(2), -1).contiguous()
+            value_cache = value_cache.permute(0, 3, 1, 2).contiguous()
+        else:
+            key_cache = key_cache.transpose(1, 2).contiguous()
+            value_cache = value_cache.transpose(1, 2).contiguous()
 
         # key_cache[block_tables] -> This will create (num_batch, max_num_blocks_per_seq, block_size, num_kv_heads, head_size)
         key = key_cache[block_tables].view(
@@ -291,6 +304,45 @@ class TestChunkedPrefill(TestCase):
             value_caches.append(value_cache)
         return key_caches, value_caches
 
+    def create_kv_caches_v2(
+        self,
+        num_blocks: int,
+        block_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+        seed: int,
+        init_value=0,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        torch.random.manual_seed(seed)
+        torch.manual_seed(seed)
+
+        scale = head_size**-0.5
+        # key_value_cache_shape = (num_blocks, num_heads, block_size, head_size)
+        # The head size is split
+        key_cache_shape = (num_blocks, num_heads, head_size // 8, block_size, 8)
+        value_cache_shape = (num_blocks, num_heads, head_size, block_size)
+        key_caches = []
+        for _ in range(num_layers):
+            key_cache = torch.empty(size=key_cache_shape, dtype=dtype)
+            if not init_value:
+                key_cache.uniform_(-scale, scale)
+            else:
+                key_cache.fill_(1)
+            key_caches.append(key_cache)
+
+        value_caches = []
+        for _ in range(num_layers):
+            value_cache = torch.empty(size=value_cache_shape, dtype=dtype)
+            if not init_value:
+                value_cache.uniform_(-scale, scale)
+            else:
+                value_cache.fill_(1)
+            value_caches.append(value_cache)
+        return key_caches, value_caches
+
+
     def chunk_prefill(
         self,
         num_seqs,
@@ -304,6 +356,7 @@ class TestChunkedPrefill(TestCase):
         version,
         dtype,
         seed,
+        use_v2,
     ) -> None:
         random.seed(seed)
         torch.random.manual_seed(seed)
@@ -349,9 +402,14 @@ class TestChunkedPrefill(TestCase):
         cu_seqlen_q = torch.cumsum(q_lens_tensor, 0)
 
         query = self.create_q_buffer(cu_seqlen_q, num_query_heads, head_size, dtype)
-        key_caches, value_caches = self.create_kv_caches(
-            max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, dtype, seed
-        )
+        if use_v2:
+            key_caches, value_caches = self.create_kv_caches_v2(
+                max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, dtype, seed
+            )
+        else:
+            key_caches, value_caches = self.create_kv_caches(
+                max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, dtype, seed
+            )
         key_cache, value_cache = key_caches[0], value_caches[0]
         # Call the paged attention kernel.
         output = torch.zeros_like(query)
@@ -383,26 +441,30 @@ class TestChunkedPrefill(TestCase):
             scale,
             alibi_slopes,
             is_causal,
+            use_v2,
         )
 
         import vllm._C.ops
         seq_lens_tensor_xpu = context_lens[1:].to("xpu")
         q_lens_tensor_xpu = q_lens_tensor[1:].to("xpu")
         context_lens_tensor_xpu = seq_lens_tensor_xpu - q_lens_tensor_xpu
-        out = vllm._C.ops.context_attention_forward_v1(query_xpu, key_cache_xpu, value_cache_xpu, block_tables_xpu, cu_seqlen_q_xpu, seq_lens_tensor_xpu , context_lens_tensor_xpu, max_seqlen_k, torch.amax(context_lens_tensor_xpu).item())
+        if not use_v2:
+            out = vllm._C.ops.context_attention_forward_v1(query_xpu, key_cache_xpu, value_cache_xpu, block_tables_xpu, cu_seqlen_q_xpu, seq_lens_tensor_xpu , context_lens_tensor_xpu, max_seqlen_k, torch.amax(q_lens_tensor_xpu).item())
+        else:
+            out = vllm._C.ops.context_attention_forward_v2(query_xpu, key_cache_xpu, value_cache_xpu, block_tables_xpu, cu_seqlen_q_xpu, seq_lens_tensor_xpu , context_lens_tensor_xpu, max_seqlen_k, torch.amax(context_lens_tensor_xpu).item())
         torch.testing.assert_close(output.cpu(), out.cpu(), atol=3e-3, rtol=1e-3)
 
-    @parametrize("num_gen_seqs", [1, 3, 8, 13, 7])
+    @parametrize("num_gen_seqs", [1, 3, 8, 13, 7, 15])
     @parametrize("max_seqlen_k", [8, 1024, 2088])
     @parametrize("num_heads", [16])
     @parametrize("num_kv_heads", [8, 16])
     @parametrize("head_size", [64, 128])
-    # @parametrize("head_size", [128])
     @parametrize("block_size", [8])
     @parametrize("use_alibi", [False])
     @parametrize("is_causal", [True])        # comment(gc): is_causal must be set to True
     @parametrize("dtype", [torch.float16])
     @parametrize("seed", [0, 22, 34, 44])
+    @parametrize("use_v2", [True, False])
     def test_chunked_prefill(
         self,
         num_gen_seqs,
@@ -415,6 +477,7 @@ class TestChunkedPrefill(TestCase):
         is_causal,
         dtype,
         seed,
+        use_v2,
     ):
         self.chunk_prefill(
             num_gen_seqs,
@@ -428,6 +491,7 @@ class TestChunkedPrefill(TestCase):
             "chunked_prefill",
             dtype,
             seed,
+            use_v2,
         )
 
 instantiate_parametrized_tests(TestChunkedPrefill)
