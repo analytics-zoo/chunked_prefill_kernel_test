@@ -10,21 +10,6 @@ from torch.testing._internal.common_utils import (
 )
 import pytest
 
-FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
-# This will change depending on the compute capability.
-# - 512 as a buffer
-MAX_SEQ_LEN = 1024
-NUM_BLOCKS = 128  # Arbitrary values for testing
-PARTITION_SIZE = 512
-
-DTYPES = [torch.float16]
-NUM_GEN_SEQS = [1]  # Arbitrary values for testing
-NUM_HEADS = [1]
-HEAD_SIZES = [64]
-BLOCK_SIZES = [32]
-USE_ALIBI = [False]
-SEEDS = [0]
-
 class TestDecodePhase(TestCase):
     def ref_chunked_prefill(
         self,
@@ -343,10 +328,14 @@ class TestDecodePhase(TestCase):
         # max_seqlen_q = 1
         query = self.create_q_buffer(cu_seqlen_q, num_query_heads, head_size, dtype)
 
-        # TODO: add v1/v2
-        key_caches, value_caches = self.create_kv_caches_v2(
-            max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, dtype, seed
-        )
+        if use_v2:
+            key_caches, value_caches = self.create_kv_caches_v2(
+                max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, dtype, seed
+            )
+        else:
+            key_caches, value_caches = self.create_kv_caches(
+                max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, dtype, seed
+            )
         key_cache, value_cache = key_caches[0], value_caches[0]
         xpu_device = torch.device("xpu")
         key_cache_xpu = key_cache.to(xpu_device)
@@ -359,23 +348,41 @@ class TestDecodePhase(TestCase):
         context_lens_xpu = context_lens[1:].to("xpu")
         block_tables_xpu = block_tables.to(xpu_device)
         import vllm._C.ops
-        vllm._C.ops.paged_attention_v1(
-            output_xpu,
-            query_xpu,
-            # Follow codes in vllm
-            key_cache_xpu.view_as(value_cache),
-            value_cache_xpu,
-            num_kv_heads,
-            scale,
-            block_tables_xpu,
-            context_lens_xpu,
-            block_size,
-            max_seqlen_k,
-            alibi_slopes,
-            "float16",  # kv_cache_dtype
-            1.0,        # k_scale
-            0.0         # logits_soft_cap
-        )
+        if use_v2:
+            vllm._C.ops.paged_attention_v1(
+                output_xpu,
+                query_xpu,
+                # Follow codes in vllm
+                key_cache_xpu.view_as(value_cache),
+                value_cache_xpu,
+                num_kv_heads,
+                scale,
+                block_tables_xpu,
+                context_lens_xpu,
+                block_size,
+                max_seqlen_k,
+                alibi_slopes,
+                "float16",  # kv_cache_dtype
+                1.0,        # k_scale
+                0.0         # logits_soft_cap
+            )
+        else:
+            # Invoke GQA
+            vllm._C.ops.paged_attention_gqa(
+                output_xpu,
+                query_xpu,
+                key_cache,
+                value_cache,
+                len(q_lens) - 1,     # bsz
+                num_heads,
+                num_kv_heads,
+                scale,
+                block_tables_xpu,
+                context_lens_xpu,
+                block_size,
+                head_size,
+                max_seqlen_k,
+            )
         # Invoke referenced implementations
         output = torch.zeros_like(query_xpu)
         output = output.to("xpu")
