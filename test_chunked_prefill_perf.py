@@ -6,8 +6,8 @@ import itertools
 
 alibi_slopes = None
 USE_ALIBI = False
-WARMUP = 3
-ITERATION_NUM = 500
+WARMUP = 100
+ITERATION_NUM = 1000
 NUM_HEADS = [32] # num_query_heads, num_kv_headss
 NUM_KV_HEADS = [4,8,32]
 HEAD_SIZE = [128]
@@ -17,6 +17,7 @@ NUM_SEQS = [8]
 DTYPE = torch.float16
 SEED = 0
 DEVICE = torch.device("xpu")
+USE_V2 = True
 
 random.seed(SEED)
 torch.random.manual_seed(SEED)
@@ -72,6 +73,43 @@ def create_kv_caches(
     return key_caches, value_caches
 
 
+def create_kv_caches_v2(
+    num_blocks: int,
+    block_size: int,
+    num_layers: int,
+    num_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    seed: int,
+    init_value=0,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    torch.random.manual_seed(seed)
+    torch.manual_seed(seed)
+
+    scale = head_size**-0.5
+    # key_value_cache_shape = (num_blocks, num_heads, block_size, head_size)
+    # The head size is split
+    key_cache_shape = (num_blocks, num_heads, head_size // 8, block_size, 8)
+    value_cache_shape = (num_blocks, num_heads, head_size, block_size)
+    key_caches = []
+    for _ in range(num_layers):
+        key_cache = torch.empty(size=key_cache_shape, dtype=dtype)
+        if not init_value:
+            key_cache.uniform_(-scale, scale)
+        else:
+            key_cache.fill_(1)
+        key_caches.append(key_cache)
+
+    value_caches = []
+    for _ in range(num_layers):
+        value_cache = torch.empty(size=value_cache_shape, dtype=dtype)
+        if not init_value:
+            value_cache.uniform_(-scale, scale)
+        else:
+            value_cache.fill_(1)
+        value_caches.append(value_cache)
+    return key_caches, value_caches
+
 # Iterate over all the possible values
 def random_test():
     for num_heads, num_kv_heads, head_size, block_size, max_seq_len, num_seqs in itertools.product(
@@ -109,8 +147,12 @@ def random_test():
         q_lens_tensor = torch.tensor(q_lens, dtype=torch.int, device="cpu")
         cu_seqlen_q = torch.cumsum(q_lens_tensor, 0)
         query = create_q_buffer(cu_seqlen_q, num_query_heads, head_size, DTYPE)
-        key_caches, value_caches = create_kv_caches(
-            max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, DTYPE, SEED)
+        if not USE_V2:
+            key_caches, value_caches = create_kv_caches(
+                max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, DTYPE, SEED)
+        else:
+            key_caches, value_caches = create_kv_caches_v2(
+                max_num_blocks_per_seq, block_size, 1, num_kv_heads, head_size, DTYPE, SEED)
         key_cache, value_cache = key_caches[0], value_caches[0]
         xpu_device = torch.device("xpu")
         cu_seqlen_q_xpu = cu_seqlen_q.to(xpu_device).int()
@@ -128,14 +170,17 @@ def random_test():
         print(f"===================================Performing random test start ==================================")
         # TODO: add more info
         print(f"Benchmark info:")
-        print(f"NUM_HEADS: {num_heads}, NUM_KV_HEADS: {num_kv_heads}, HEAD_SIZE: {head_size}, BLOCK_SIZE: {block_size}, MAX_SEQ_LEN: {max_seq_len}, NUM_SEQS: {num_seqs}")
+        print(f"NUM_HEADS: {num_heads}, NUM_KV_HEADS: {num_kv_heads}, HEAD_SIZE: {head_size}, BLOCK_SIZE: {block_size}, MAX_SEQ_LEN: {max_seq_len}, NUM_SEQS: {num_seqs}, USE_V2: {USE_V2}")
         print(f"Seq lens: {seq_lens_tensor_xpu.tolist()}")
         print(f"Context lens: {context_lens_tensor_xpu.tolist()}")
         print(f"Query lens: {(seq_lens_tensor_xpu - context_lens_tensor_xpu).tolist()}")
         for i in range(WARMUP + ITERATION_NUM):
             torch.xpu.synchronize()
             st = time.time()
-            out = vllm._C.ops.context_attention_forward_v1(query_xpu, key_cache_xpu, value_cache_xpu, block_tables_xpu, cu_seqlen_q_xpu, seq_lens_tensor_xpu , context_lens_tensor_xpu, max_seqlen_k, max_context_len)
+            if not USE_V2:
+                out = vllm._C.ops.context_attention_forward_v1(query_xpu, key_cache_xpu, value_cache_xpu, block_tables_xpu, cu_seqlen_q_xpu, seq_lens_tensor_xpu , context_lens_tensor_xpu, max_seqlen_k, max_context_len)
+            else:
+                out = vllm._C.ops.context_attention_forward_v2(query_xpu, key_cache_xpu, value_cache_xpu, block_tables_xpu, cu_seqlen_q_xpu, seq_lens_tensor_xpu , context_lens_tensor_xpu, max_seqlen_k, max_context_len, torch.amax(q_lens_tensor_xpu).item())
             torch.xpu.synchronize()
             et = time.time()
             if i >= WARMUP:
