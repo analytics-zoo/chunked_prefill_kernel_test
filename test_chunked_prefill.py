@@ -371,8 +371,8 @@ class TestDecodePhase(TestCase):
             vllm._C.ops.paged_attention_gqa(
                 output_xpu,
                 query_xpu,
-                key_cache,
-                value_cache,
+                key_cache_xpu,
+                value_cache_xpu,
                 len(q_lens) - 1,     # bsz
                 num_heads,
                 num_kv_heads,
